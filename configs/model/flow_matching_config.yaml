@@ -1,0 +1,20 @@
+# Flow Matching Action Head Configuration
+# ========================================
+
+# Action space
+action_dim: 7  # 7-DOF for Franka/UR5e
+chunk_size: 16  # Predict 16 timesteps at once
+
+# Network architecture
+hidden_dim: 512
+
+# Flow matching settings
+num_steps: 100  # Number of flow steps for inference
+sigma_min: 0.0001
+sigma_max: 1.0
+
+# ODE solver
+ode_solver: "euler"  # Options: euler, heun, rk4
+
+# Training
+time_distribution: "uniform"  # Options: uniform, logit_normal, beta

@@ -1,0 +1,73 @@
+# UR5e Robot Configuration
+# ========================
+
+robot_type: "ur5e"
+action_dim: 6  # 6-DOF arm
+proprio_dim: 12  # 6 positions + 6 velocities
+
+# USD path
+usd_path: "${ISAACLAB_NUCLEUS_DIR}/Robots/UniversalRobots/UR5e/ur5e_instanceable.usd"
+
+# Joint configuration
+joints:
+  arm:
+    - shoulder_pan_joint
+    - shoulder_lift_joint
+    - elbow_joint
+    - wrist_1_joint
+    - wrist_2_joint
+    - wrist_3_joint
+
+# Joint limits (radians) - UR5e has very wide limits
+joint_limits:
+  shoulder_pan_joint: [-6.2832, 6.2832]
+  shoulder_lift_joint: [-6.2832, 6.2832]
+  elbow_joint: [-3.1416, 3.1416]
+  wrist_1_joint: [-6.2832, 6.2832]
+  wrist_2_joint: [-6.2832, 6.2832]
+  wrist_3_joint: [-6.2832, 6.2832]
+
+# Velocity limits (rad/s)
+velocity_limits:
+  shoulder_pan_joint: 3.14
+  shoulder_lift_joint: 3.14
+  elbow_joint: 3.14
+  wrist_1_joint: 3.14
+  wrist_2_joint: 3.14
+  wrist_3_joint: 3.14
+
+# Default joint positions
+default_joint_pos:
+  shoulder_pan_joint: 0.0
+  shoulder_lift_joint: -1.5708
+  elbow_joint: 1.5708
+  wrist_1_joint: -1.5708
+  wrist_2_joint: -1.5708
+  wrist_3_joint: 0.0
+
+# End-effector
+ee_frame: "ee_link"
+
+# Actuator settings
+actuators:
+  arm:
+    stiffness: 800.0
+    damping: 40.0
+    effort_limit: 150.0
+    velocity_limit: 3.14
+
+# Camera configuration
+cameras:
+  context:
+    resolution: [224, 224]
+    position: [1.5, 0.0, 1.2]
+    rotation: [0.9239, 0.0, 0.3827, 0.0]
+    focal_length: 24.0
+    clipping_range: [0.1, 10.0]
+  wrist:
+    resolution: [224, 224]
+    parent_frame: "ee_link"
+    position: [0.0, 0.0, 0.05]
+    rotation: [0.7071, 0.0, 0.7071, 0.0]
+    focal_length: 24.0
+    clipping_range: [0.01, 5.0]

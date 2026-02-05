@@ -1,0 +1,85 @@
+# Franka Panda Robot Configuration
+# =================================
+
+robot_type: "franka_panda"
+action_dim: 7  # 7-DOF arm
+proprio_dim: 14  # 7 positions + 7 velocities
+
+# USD path
+usd_path: "${ISAACLAB_NUCLEUS_DIR}/Robots/FrankaEmika/panda_instanceable.usd"
+
+# Joint configuration
+joints:
+  arm:
+    - panda_joint1
+    - panda_joint2
+    - panda_joint3
+    - panda_joint4
+    - panda_joint5
+    - panda_joint6
+    - panda_joint7
+  gripper:
+    - panda_finger_joint1
+    - panda_finger_joint2
+
+# Joint limits (radians)
+joint_limits:
+  panda_joint1: [-2.8973, 2.8973]
+  panda_joint2: [-1.7628, 1.7628]
+  panda_joint3: [-2.8973, 2.8973]
+  panda_joint4: [-3.0718, -0.0698]
+  panda_joint5: [-2.8973, 2.8973]
+  panda_joint6: [-0.0175, 3.7525]
+  panda_joint7: [-2.8973, 2.8973]
+
+# Velocity limits (rad/s)
+velocity_limits:
+  panda_joint1: 2.175
+  panda_joint2: 2.175
+  panda_joint3: 2.175
+  panda_joint4: 2.175
+  panda_joint5: 2.61
+  panda_joint6: 2.61
+  panda_joint7: 2.61
+
+# Default joint positions
+default_joint_pos:
+  panda_joint1: 0.0
+  panda_joint2: -0.569
+  panda_joint3: 0.0
+  panda_joint4: -2.810
+  panda_joint5: 0.0
+  panda_joint6: 3.037
+  panda_joint7: 0.741
+  panda_finger_joint1: 0.04
+  panda_finger_joint2: 0.04
+
+# End-effector
+ee_frame: "panda_hand"
+
+# Actuator settings
+actuators:
+  arm:
+    stiffness: [80.0, 80.0, 80.0, 80.0, 40.0, 40.0, 40.0]
+    damping: [4.0, 4.0, 4.0, 4.0, 2.0, 2.0, 2.0]
+    effort_limit: [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+  gripper:
+    stiffness: 2000.0
+    damping: 100.0
+    effort_limit: 200.0
+
+# Camera configuration
+cameras:
+  context:
+    resolution: [224, 224]
+    position: [1.5, 0.0, 1.2]
+    rotation: [0.9239, 0.0, 0.3827, 0.0]  # quaternion (w, x, y, z)
+    focal_length: 24.0
+    clipping_range: [0.1, 10.0]
+  wrist:
+    resolution: [224, 224]
+    parent_frame: "panda_hand"
+    position: [0.05, 0.0, 0.05]
+    rotation: [0.7071, 0.0, 0.7071, 0.0]
+    focal_length: 24.0
+    clipping_range: [0.01, 5.0]

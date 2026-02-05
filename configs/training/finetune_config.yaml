@@ -1,0 +1,78 @@
+# VLA Fine-tuning Configuration
+# ==============================
+# For task-specific fine-tuning after pretraining
+
+# Data
+data:
+  train_dir: "data/demos/finetune/train"
+  val_dir: "data/demos/finetune/val"
+  chunk_size: 16
+  image_size: [224, 224]
+  augment: true
+
+# Model - start from pretrained
+model:
+  pretrained_checkpoint: "checkpoints/pretrain/best.pt"
+  action_dim: 7
+  chunk_size: 16
+  hidden_dim: 512
+  # Fine-tuning specific
+  freeze_vlm: true  # Keep VLM frozen
+  use_lora: true
+  lora_r: 16
+  # Optionally increase LoRA rank for fine-tuning
+  finetune_lora_r: 32
+
+# Training - lower LR for fine-tuning
+training:
+  epochs: 50
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  effective_batch_size: 32
+
+  # Optimizer - lower LR for fine-tuning
+  optimizer: "adamw"
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Scheduler
+  scheduler: "cosine"
+  warmup_steps: 200
+  min_lr: 1.0e-6
+
+  # Mixed precision
+  use_amp: true
+  amp_dtype: "bfloat16"
+
+# Checkpointing
+checkpointing:
+  checkpoint_dir: "checkpoints/finetune"
+  save_every_n_steps: 500
+  eval_every_n_steps: 250
+  log_every_n_steps: 10
+
+# Logging
+logging:
+  wandb_project: "vla-finetune"
+  wandb_run_name: null
+  log_images: true
+
+# Early stopping - tighter for fine-tuning
+early_stopping:
+  patience: 5
+  metric: "val_loss"
+
+# Task-specific settings
+task:
+  name: "pick_place"  # or "reach"
+  robot: "franka"  # or "ur5e"
+  instruction_templates:
+    - "Pick up the {object} and place it on the {target}."
+    - "Grasp the {object} and move it to the {target}."
+    - "Move the {object} to the {target} location."
+
+# Resources
+device: "cuda"
+num_workers: 4
+seed: 42
