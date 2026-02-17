@@ -42,9 +42,10 @@ class SinusoidalPosEmb(nn.Module):
             Positional embeddings [B, dim]
         """
         device = t.device
+        dtype = t.dtype
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
         emb = t[:, None] * emb[None, :]
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
@@ -211,9 +212,10 @@ class FlowMatchingActionHead(nn.Module):
         num_steps = num_steps or self.config.num_steps
         batch_size = condition.shape[0]
         device = condition.device
+        dtype = condition.dtype  # match dtype (e.g. bfloat16)
 
         # Start from prior
-        x_t = torch.randn(batch_size, self.total_action_dim, device=device)
+        x_t = torch.randn(batch_size, self.total_action_dim, device=device, dtype=dtype)
 
         # Time steps
         dt = 1.0 / num_steps
@@ -221,14 +223,14 @@ class FlowMatchingActionHead(nn.Module):
         # ODE integration
         if self.config.ode_solver == "euler":
             for i in range(num_steps):
-                t = torch.full((batch_size,), i / num_steps, device=device)
+                t = torch.full((batch_size,), i / num_steps, device=device, dtype=dtype)
                 v = self.forward(x_t, t, condition)
                 x_t = x_t + v * dt
 
         elif self.config.ode_solver == "heun":
             for i in range(num_steps):
-                t = torch.full((batch_size,), i / num_steps, device=device)
-                t_next = torch.full((batch_size,), (i + 1) / num_steps, device=device)
+                t = torch.full((batch_size,), i / num_steps, device=device, dtype=dtype)
+                t_next = torch.full((batch_size,), (i + 1) / num_steps, device=device, dtype=dtype)
 
                 # Euler step
                 v1 = self.forward(x_t, t, condition)

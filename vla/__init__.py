@@ -14,6 +14,7 @@ from .models import (
     FlowMatchingActionHead,
     ActionExpert,
     create_vla_model,
+    load_vla_for_inference,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "FlowMatchingActionHead",
     "ActionExpert",
     "create_vla_model",
+    "load_vla_for_inference",
 ]

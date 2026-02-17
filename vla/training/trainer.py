@@ -7,7 +7,8 @@ Main trainer class for Vision-Language-Action model training.
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional, Any, List, Callable
@@ -251,11 +252,16 @@ class VLATrainer:
             batch = self._move_to_device(batch)
 
             # Forward pass with mixed precision
-            with autocast(enabled=self.config.use_amp, dtype=self.amp_dtype):
+            with autocast('cuda', enabled=self.config.use_amp, dtype=self.amp_dtype):
+                # Get instructions as list
+                instructions = batch['instruction']
+                if isinstance(instructions, str):
+                    instructions = [instructions] * batch['context_image'].shape[0]
+
                 outputs = self.model(
-                    vlm_inputs=batch.get('vlm_inputs'),
-                    images=[batch['context_image'], batch['wrist_image']],
-                    instruction=batch['instruction'][0],  # Batch instructions
+                    context_images=batch['context_image'],
+                    wrist_images=batch['wrist_image'],
+                    instructions=instructions,
                     proprio_state=batch.get('proprio_state'),
                     target_actions=batch['actions'],
                 )
@@ -320,10 +326,16 @@ class VLATrainer:
         for batch in tqdm(self.val_loader, desc="Validation"):
             batch = self._move_to_device(batch)
 
-            with autocast(enabled=self.config.use_amp, dtype=self.amp_dtype):
+            with autocast('cuda', enabled=self.config.use_amp, dtype=self.amp_dtype):
+                # Get instructions as list
+                instructions = batch['instruction']
+                if isinstance(instructions, str):
+                    instructions = [instructions] * batch['context_image'].shape[0]
+
                 outputs = self.model(
-                    images=[batch['context_image'], batch['wrist_image']],
-                    instruction=batch['instruction'][0],
+                    context_images=batch['context_image'],
+                    wrist_images=batch['wrist_image'],
+                    instructions=instructions,
                     proprio_state=batch.get('proprio_state'),
                     target_actions=batch['actions'],
                 )
@@ -355,31 +367,134 @@ class VLATrainer:
             import wandb
             wandb.log(metrics, step=self.global_step)
 
-    def _save_checkpoint(self, name: str) -> None:
-        """Save model checkpoint."""
+    def _save_checkpoint(self, name: str, lightweight: bool = True) -> None:
+        """
+        Save model checkpoint.
+
+        Args:
+            name: Checkpoint name
+            lightweight: If True, only save trainable weights (~100MB instead of ~16GB)
+        """
         checkpoint_path = self.checkpoint_dir / f"{name}.pt"
 
-        checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "global_step": self.global_step,
-            "epoch": self.epoch,
-            "best_val_loss": self.best_val_loss,
-            "config": vars(self.config),
-        }
+        if lightweight:
+            # Only save trainable components (LoRA, projector, action_expert, flow_head)
+            # This reduces checkpoint size from ~16GB to ~100-200MB
+            checkpoint = {
+                "checkpoint_type": "lightweight",
+                # Trainable model components
+                "projector_state_dict": self.model.projector.state_dict(),
+                "action_expert_state_dict": self.model.action_expert.state_dict(),
+                "flow_head_state_dict": self.model.flow_head.state_dict(),
+                # Normalization stats
+                "action_mean": self.model.action_mean,
+                "action_std": self.model.action_std,
+                "proprio_mean": getattr(self.model, '_proprio_mean', None),
+                "proprio_std": getattr(self.model, '_proprio_std', None),
+                "dataset_action_mean": getattr(self.model, '_dataset_action_mean', None),
+                "dataset_action_std": getattr(self.model, '_dataset_action_std', None),
+                # Training state
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "global_step": self.global_step,
+                "epoch": self.epoch,
+                "best_val_loss": self.best_val_loss,
+                "config": vars(self.config),
+            }
+
+            # Save LoRA weights if they exist
+            if hasattr(self.model.vision_encoder, 'lora_modules'):
+                checkpoint["lora_state_dict"] = self.model.vision_encoder.lora_modules.state_dict()
+        else:
+            # Full checkpoint (legacy mode)
+            checkpoint = {
+                "checkpoint_type": "full",
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
+                "global_step": self.global_step,
+                "epoch": self.epoch,
+                "best_val_loss": self.best_val_loss,
+                "config": vars(self.config),
+            }
 
         if self.scaler is not None:
             checkpoint["scaler_state_dict"] = self.scaler.state_dict()
 
         torch.save(checkpoint, checkpoint_path)
-        self.logger.info(f"Saved checkpoint: {checkpoint_path}")
+
+        # Log checkpoint size
+        size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
+        self.logger.info(f"Saved checkpoint: {checkpoint_path} ({size_mb:.1f} MB)")
 
     def load_checkpoint(self, path: str) -> None:
-        """Load checkpoint to resume training."""
-        checkpoint = torch.load(path, map_location=self.device)
+        """
+        Load checkpoint to resume training.
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        Supports both lightweight (trainable weights only) and full checkpoints.
+        """
+        # Always load to CPU first to avoid OOM
+        checkpoint = torch.load(path, map_location='cpu')
+
+        checkpoint_type = checkpoint.get("checkpoint_type", "full")
+
+        if checkpoint_type == "lightweight":
+            # Load trainable components only
+            self.model.projector.load_state_dict(checkpoint["projector_state_dict"])
+            self.model.action_expert.load_state_dict(checkpoint["action_expert_state_dict"])
+            self.model.flow_head.load_state_dict(checkpoint["flow_head_state_dict"])
+
+            # Load action normalization stats
+            if "action_mean" in checkpoint:
+                self.model.action_mean = checkpoint["action_mean"]
+            if "action_std" in checkpoint:
+                self.model.action_std = checkpoint["action_std"]
+
+            # Load LoRA weights if present
+            if "lora_state_dict" in checkpoint and hasattr(self.model.vision_encoder, 'lora_modules'):
+                self.model.vision_encoder.lora_modules.load_state_dict(checkpoint["lora_state_dict"])
+
+            self.logger.info(f"Loaded lightweight checkpoint from {path}")
+        else:
+            # Full checkpoint (legacy) - extract only trainable weights to avoid OOM
+            full_state = checkpoint["model_state_dict"]
+
+            # Extract and load projector weights
+            projector_state = {k.replace("projector.", ""): v for k, v in full_state.items() if k.startswith("projector.")}
+            if projector_state:
+                self.model.projector.load_state_dict(projector_state)
+
+            # Extract and load action_expert weights
+            action_expert_state = {k.replace("action_expert.", ""): v for k, v in full_state.items() if k.startswith("action_expert.")}
+            if action_expert_state:
+                self.model.action_expert.load_state_dict(action_expert_state)
+
+            # Extract and load flow_head weights
+            flow_head_state = {k.replace("flow_head.", ""): v for k, v in full_state.items() if k.startswith("flow_head.")}
+            if flow_head_state:
+                self.model.flow_head.load_state_dict(flow_head_state)
+
+            # Extract and load LoRA weights
+            if hasattr(self.model.vision_encoder, 'lora_modules'):
+                lora_state = {k.replace("vision_encoder.lora_modules.", ""): v for k, v in full_state.items() if "lora_modules" in k}
+                if lora_state:
+                    self.model.vision_encoder.lora_modules.load_state_dict(lora_state)
+
+            # Load normalization stats
+            if "action_mean" in full_state:
+                self.model.action_mean = full_state["action_mean"]
+            if "action_std" in full_state:
+                self.model.action_std = full_state["action_std"]
+
+            # Clear full_state to free memory
+            del full_state
+            del checkpoint["model_state_dict"]
+            import gc
+            gc.collect()
+
+            self.logger.info(f"Loaded trainable weights from full checkpoint: {path}")
+
+        # Load training state
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self.global_step = checkpoint["global_step"]
@@ -388,8 +503,6 @@ class VLATrainer:
 
         if self.scaler is not None and "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-
-        self.logger.info(f"Loaded checkpoint from {path}")
 
     def add_callback(self, callback: Callable) -> None:
         """Add a training callback."""

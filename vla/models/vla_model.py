@@ -165,6 +165,10 @@ class VLAModel(nn.Module):
         proprio_state: Optional[torch.Tensor] = None,
         target_actions: Optional[torch.Tensor] = None,
         vlm_inputs: Optional[Dict[str, torch.Tensor]] = None,
+        # Batched inputs for training
+        context_images: Optional[torch.Tensor] = None,
+        wrist_images: Optional[torch.Tensor] = None,
+        instructions: Optional[List[str]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the VLA model.
@@ -173,17 +177,27 @@ class VLAModel(nn.Module):
         For inference: omit target_actions to sample actions
 
         Args:
-            images: List of images [context_cam, wrist_cam]
-            instruction: Language instruction
+            images: List of images [context_cam, wrist_cam] (single sample)
+            instruction: Language instruction (single sample)
             proprio_state: Robot proprioceptive state [B, proprio_dim]
             target_actions: Target action chunks [B, chunk_size, action_dim]
             vlm_inputs: Pre-processed VLM inputs (alternative to images+instruction)
+            context_images: Batched context camera images [B, C, H, W]
+            wrist_images: Batched wrist camera images [B, C, H, W]
+            instructions: List of B instruction strings
 
         Returns:
             Dictionary containing loss (training) or sampled actions (inference)
         """
-        # Get VLM embeddings
-        if vlm_inputs is not None:
+        # Get VLM embeddings - handle batched inputs for training
+        if context_images is not None and wrist_images is not None:
+            vlm_outputs = self.vision_encoder(
+                context_images=context_images,
+                wrist_images=wrist_images,
+                instructions=instructions,
+                return_last_hidden_state=True,
+            )
+        elif vlm_inputs is not None:
             vlm_outputs = self.vision_encoder(
                 inputs=vlm_inputs,
                 return_last_hidden_state=True,
@@ -195,7 +209,7 @@ class VLAModel(nn.Module):
                 return_last_hidden_state=True,
             )
         else:
-            raise ValueError("Either 'vlm_inputs' or both 'images' and 'instruction' required")
+            raise ValueError("Either batched inputs, 'vlm_inputs', or 'images'+'instruction' required")
 
         # Project VLM embeddings
         vlm_embeddings = vlm_outputs.get('last_hidden_state', vlm_outputs.get('pooled_output'))
@@ -264,9 +278,13 @@ class VLAModel(nn.Module):
         if num_samples > 1:
             condition = condition.expand(num_samples, -1)
 
-        # Sample actions
+        # Sample actions — ensure condition dtype matches flow_head weights
+        flow_dtype = next(self.flow_head.parameters()).dtype
+        condition = condition.to(dtype=flow_dtype)
         normalized_actions = self.flow_head.sample(condition)
-        actions = self.denormalize_actions(normalized_actions)
+
+        # Denormalize in float32 for precision
+        actions = normalized_actions.float() * self.action_std.float() + self.action_mean.float()
 
         return actions
 
@@ -290,13 +308,14 @@ class VLAModel(nn.Module):
 
     def save_checkpoint(self, path: str, include_vlm: bool = False):
         """
-        Save model checkpoint.
+        Save model checkpoint (lightweight by default).
 
         Args:
             path: Save path
-            include_vlm: Whether to include full VLM weights (large!)
+            include_vlm: Whether to include full VLM weights (adds ~15GB!)
         """
         checkpoint = {
+            'checkpoint_type': 'lightweight' if not include_vlm else 'full',
             'config': self.config,
             'projector': self.projector.state_dict(),
             'action_expert': self.action_expert.state_dict(),
@@ -306,7 +325,7 @@ class VLAModel(nn.Module):
         }
 
         # Save LoRA weights
-        if self.config.vision_encoder.use_lora:
+        if self.config.vision_encoder.use_lora and hasattr(self.vision_encoder, 'lora_modules'):
             checkpoint['lora_weights'] = self.vision_encoder.lora_modules.state_dict()
 
         # Optionally include full VLM
@@ -319,27 +338,55 @@ class VLAModel(nn.Module):
         """
         Load model checkpoint.
 
+        Supports both lightweight (trainable only) and full checkpoints.
+        For lightweight checkpoints, VLM is loaded fresh from HuggingFace.
+
         Args:
             path: Checkpoint path
-            load_vlm: Whether to load full VLM weights
+            load_vlm: Whether to load full VLM weights (if available)
         """
-        checkpoint = torch.load(path, map_location='cpu')
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
 
-        # Load component weights
-        self.projector.load_state_dict(checkpoint['projector'])
-        self.action_expert.load_state_dict(checkpoint['action_expert'])
-        self.flow_head.load_state_dict(checkpoint['flow_head'])
+        # Handle trainer checkpoint format
+        if 'projector_state_dict' in checkpoint:
+            # Trainer lightweight format
+            self.projector.load_state_dict(checkpoint['projector_state_dict'])
+            self.action_expert.load_state_dict(checkpoint['action_expert_state_dict'])
+            self.flow_head.load_state_dict(checkpoint['flow_head_state_dict'])
 
-        # Load normalization stats
-        if 'action_mean' in checkpoint:
-            self.action_mean = checkpoint['action_mean']
-        if 'action_std' in checkpoint:
-            self.action_std = checkpoint['action_std']
+            if 'action_mean' in checkpoint:
+                self.action_mean = checkpoint['action_mean']
+            if 'action_std' in checkpoint:
+                self.action_std = checkpoint['action_std']
 
-        # Load LoRA weights
-        if 'lora_weights' in checkpoint:
-            self.vision_encoder.initialize()  # Ensure model is loaded
-            self.vision_encoder.lora_modules.load_state_dict(checkpoint['lora_weights'])
+            if 'lora_state_dict' in checkpoint and hasattr(self.vision_encoder, 'lora_modules'):
+                self.vision_encoder.initialize()
+                self.vision_encoder.lora_modules.load_state_dict(checkpoint['lora_state_dict'])
+
+        elif 'projector' in checkpoint:
+            # Model lightweight format
+            self.projector.load_state_dict(checkpoint['projector'])
+            self.action_expert.load_state_dict(checkpoint['action_expert'])
+            self.flow_head.load_state_dict(checkpoint['flow_head'])
+
+            if 'action_mean' in checkpoint:
+                self.action_mean = checkpoint['action_mean']
+            if 'action_std' in checkpoint:
+                self.action_std = checkpoint['action_std']
+
+            if 'lora_weights' in checkpoint and hasattr(self.vision_encoder, 'lora_modules'):
+                self.vision_encoder.initialize()
+                self.vision_encoder.lora_modules.load_state_dict(checkpoint['lora_weights'])
+
+        elif 'model_state_dict' in checkpoint:
+            # Full trainer checkpoint (legacy)
+            self.load_state_dict(checkpoint['model_state_dict'])
+
+        # Restore proprio normalization stats if available
+        if 'proprio_mean' in checkpoint and checkpoint['proprio_mean'] is not None:
+            self._proprio_mean = checkpoint['proprio_mean']
+        if 'proprio_std' in checkpoint and checkpoint['proprio_std'] is not None:
+            self._proprio_std = checkpoint['proprio_std']
 
         # Optionally load full VLM
         if load_vlm and 'vlm_state_dict' in checkpoint:
@@ -347,11 +394,70 @@ class VLAModel(nn.Module):
             self.vision_encoder.model.load_state_dict(checkpoint['vlm_state_dict'])
 
 
+def load_vla_for_inference(
+    checkpoint_path: str,
+    model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+    device: str = "cuda",
+) -> VLAModel:
+    """
+    Load a trained VLA model for inference.
+
+    This loads a lightweight checkpoint and the VLM from HuggingFace.
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model_name: Qwen VL model name (for loading fresh VLM)
+        device: Device to load model on
+
+    Returns:
+        VLAModel ready for inference
+    """
+    # Load checkpoint to get config
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    # Get config from checkpoint or use defaults
+    if 'config' in checkpoint and hasattr(checkpoint['config'], 'action_dim'):
+        config = checkpoint['config']
+        model = VLAModel(config)
+    else:
+        # Infer dimensions from saved weights
+        action_expert_state = checkpoint.get('action_expert_state_dict', checkpoint.get('action_expert', {}))
+        if 'action_queries' in action_expert_state:
+            chunk_size = action_expert_state['action_queries'].shape[0]
+        else:
+            chunk_size = 16
+
+        model = create_vla_model(
+            model_name=model_name,
+            action_dim=7,
+            chunk_size=chunk_size,
+            proprio_dim=27,
+        )
+
+    # Load checkpoint weights
+    model.load_checkpoint(checkpoint_path)
+
+    # Move to device and set to eval mode
+    model.to(device)
+
+    # Cast trainable components to bfloat16 to match VLM output dtype.
+    # The VLM backbone runs in bfloat16 (via device_map="auto"), so the
+    # projector, action_expert, and flow_head must also be bfloat16.
+    model.projector.to(dtype=torch.bfloat16)
+    model.action_expert.to(dtype=torch.bfloat16)
+    model.flow_head.to(dtype=torch.bfloat16)
+
+    model.eval()
+
+    return model
+
+
 def create_vla_model(
     model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
     action_dim: int = 7,
     chunk_size: int = 16,
     hidden_dim: int = 512,
+    proprio_dim: int = 27,
     freeze_vlm: bool = True,
     use_lora: bool = True,
     lora_r: int = 16,
@@ -365,6 +471,7 @@ def create_vla_model(
         action_dim: Robot action dimension
         chunk_size: Number of action steps to predict
         hidden_dim: Hidden dimension for action expert
+        proprio_dim: Proprioception dimension
         freeze_vlm: Whether to freeze VLM backbone
         use_lora: Whether to use LoRA adapters
         lora_r: LoRA rank
@@ -389,6 +496,7 @@ def create_vla_model(
             hidden_dim=hidden_dim,
             action_dim=action_dim,
             chunk_size=chunk_size,
+            proprio_dim=proprio_dim,
         ),
         flow_matching=FlowMatchingConfig(
             action_dim=action_dim,

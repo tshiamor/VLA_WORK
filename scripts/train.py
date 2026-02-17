@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import yaml
 import torch
 from pathlib import Path
@@ -26,17 +27,24 @@ from vla.models.projector import ProjectorConfig
 from vla.models.action_expert import ActionExpertConfig
 from vla.models.flow_matching import FlowMatchingConfig
 from vla.training import VLATrainer, TrainerConfig
-from vla.data import create_dataloader
+from vla.data import create_dataloader, create_hdf5_dataloader, verify_hdf5_dataset
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train VLA model")
 
-    # Data
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="Path to training data directory")
+    # Data (either data_dir for folder-based or hdf5_path for HDF5 file)
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Path to training data directory (folder-based)")
+    parser.add_argument("--hdf5_path", type=str, default=None,
+                        help="Path to HDF5 file containing all demos")
     parser.add_argument("--val_data_dir", type=str, default=None,
                         help="Path to validation data directory")
+    parser.add_argument("--val_hdf5_path", type=str, default=None,
+                        help="Path to validation HDF5 file")
+    parser.add_argument("--instruction", type=str,
+                        default="Pick up the object and place it in the target location.",
+                        help="Task instruction for VLA")
 
     # Model
     parser.add_argument("--vlm_model", type=str,
@@ -48,6 +56,8 @@ def parse_args():
                         help="Action chunk size")
     parser.add_argument("--hidden_dim", type=int, default=512,
                         help="Hidden dimension for action expert")
+    parser.add_argument("--proprio_dim", type=int, default=27,
+                        help="Proprioception dimension (default: 27 for joint_pos+joint_vel+eef_pos+eef_quat+gripper)")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100,
@@ -79,6 +89,10 @@ def parse_args():
     parser.add_argument("--wandb_run", type=str, default=None,
                         help="Wandb run name")
 
+    # Key mapping
+    parser.add_argument("--key_mapping_file", type=str, default=None,
+                        help="Path to JSON file mapping canonical keys to dataset-specific keys")
+
     # Config file (overrides CLI args)
     parser.add_argument("--config", type=str, default=None,
                         help="Path to YAML config file")
@@ -107,17 +121,39 @@ def main():
             if hasattr(args, key):
                 setattr(args, key, value)
 
+    # Load key mapping if specified
+    key_mapping = None
+    if args.key_mapping_file:
+        with open(args.key_mapping_file, 'r') as f:
+            key_mapping = json.load(f)
+        print(f"Loaded key mapping from {args.key_mapping_file}")
+
+    # Validate data source
+    if not args.data_dir and not args.hdf5_path:
+        raise ValueError("Must specify either --data_dir or --hdf5_path")
+
+    use_hdf5 = args.hdf5_path is not None
+    data_source = args.hdf5_path if use_hdf5 else args.data_dir
+
     print("=" * 60)
     print("VLA Training")
     print("=" * 60)
     print(f"VLM Model: {args.vlm_model}")
-    print(f"Data Directory: {args.data_dir}")
+    print(f"Data Source: {data_source} ({'HDF5' if use_hdf5 else 'Directory'})")
+    if use_hdf5:
+        print(f"Instruction: {args.instruction}")
     print(f"Action Dimension: {args.action_dim}")
+    print(f"Proprio Dimension: {args.proprio_dim}")
     print(f"Chunk Size: {args.chunk_size}")
     print(f"Batch Size: {args.batch_size}")
     print(f"Learning Rate: {args.lr}")
     print(f"Epochs: {args.epochs}")
     print("=" * 60)
+
+    # Verify HDF5 dataset if using HDF5 format
+    if use_hdf5:
+        print("\nVerifying HDF5 dataset...")
+        verify_hdf5_dataset(args.hdf5_path)
 
     # Create model
     print("\nCreating VLA model...")
@@ -126,6 +162,7 @@ def main():
         action_dim=args.action_dim,
         chunk_size=args.chunk_size,
         hidden_dim=args.hidden_dim,
+        proprio_dim=args.proprio_dim,
         freeze_vlm=True,
         use_lora=args.use_lora,
         lora_r=args.lora_r,
@@ -141,18 +178,63 @@ def main():
 
     # Create data loaders
     print("\nLoading training data...")
-    train_loader = create_dataloader(
-        args.data_dir,
-        batch_size=args.batch_size,
-        num_workers=4,
-        chunk_size=args.chunk_size,
-        action_dim=args.action_dim,
-        augment=True,
-    )
+
+    if use_hdf5:
+        # HDF5 file format
+        hdf5_kwargs = dict(
+            chunk_size=args.chunk_size,
+            instruction=args.instruction,
+            augment=True,
+        )
+        if key_mapping:
+            hdf5_kwargs["key_mapping"] = key_mapping
+        train_loader = create_hdf5_dataloader(
+            args.hdf5_path,
+            batch_size=args.batch_size,
+            num_workers=4,
+            **hdf5_kwargs,
+        )
+    else:
+        # Folder-based format
+        train_loader = create_dataloader(
+            args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=4,
+            chunk_size=args.chunk_size,
+            action_dim=args.action_dim,
+            augment=True,
+        )
     print(f"Training samples: {len(train_loader.dataset)}")
 
+    # Store dataset normalization stats on model for checkpointing.
+    # The dataset normalizes actions/proprio in __getitem__, so the model's
+    # own action_mean/std stay at 0/1.  We save the dataset stats separately
+    # so inference scripts can denormalize correctly.
+    if use_hdf5 and hasattr(train_loader.dataset, 'get_stats'):
+        dataset_stats = train_loader.dataset.get_stats()
+        model._proprio_mean = dataset_stats['proprio_mean']
+        model._proprio_std = dataset_stats['proprio_std']
+        model._dataset_action_mean = dataset_stats['action_mean']
+        model._dataset_action_std = dataset_stats['action_std']
+
     val_loader = None
-    if args.val_data_dir:
+    if args.val_hdf5_path:
+        print("Loading validation data (HDF5)...")
+        val_hdf5_kwargs = dict(
+            chunk_size=args.chunk_size,
+            instruction=args.instruction,
+            augment=False,
+        )
+        if key_mapping:
+            val_hdf5_kwargs["key_mapping"] = key_mapping
+        val_loader = create_hdf5_dataloader(
+            args.val_hdf5_path,
+            batch_size=args.batch_size,
+            num_workers=4,
+            **val_hdf5_kwargs,
+        )
+        print(f"Validation samples: {len(val_loader.dataset)}")
+    elif args.val_data_dir:
         print("Loading validation data...")
         val_loader = create_dataloader(
             args.val_data_dir,

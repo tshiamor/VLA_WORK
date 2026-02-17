@@ -8,10 +8,123 @@ Command-line tools for training, evaluating, and visualizing VLA models.
 
 | Script | Purpose |
 |--------|---------|
+| `setup_env.sh` | **Setup conda environment and install dependencies** |
+| `verify_dataset.py` | Verify HDF5 dataset compatibility |
 | `train.py` | Train VLA model on demonstration data |
+| `train_mcx_card.sh` | Quick-start training on MCX card dataset |
 | `evaluate.py` | Evaluate trained model in Isaac Lab simulation |
 | `collect_demos.py` | Collect robot demonstrations for training |
 | `visualize.py` | Visualize model predictions and internals |
+| `overfit_test.py` | **Overfit test**: train on N demos to verify pipeline correctness |
+| `diagnose_conditioning.py` | **Diagnosis**: test VLM embeddings, condition vectors, and flow head isolation |
+| `inspect_nvidia_dataset.py` | Inspect NVIDIA Cosmos HDF5 dataset structure |
+| `diagnose_vla.py` | General VLA model diagnostics |
+
+---
+
+## Quick Start
+
+```bash
+# 1. Setup environment
+./scripts/setup_env.sh
+
+# 2. Verify your dataset
+python scripts/verify_dataset.py --hdf5_path /path/to/demos.hdf5
+
+# 3. Train
+./scripts/train_mcx_card.sh
+```
+
+---
+
+## setup_env.sh
+
+Automated environment setup script. Installs all dependencies and verifies the installation.
+
+### Usage
+
+```bash
+# Install in current environment
+./scripts/setup_env.sh
+
+# Create fresh 'vla' conda environment
+./scripts/setup_env.sh --new
+
+# Create custom-named environment
+./scripts/setup_env.sh --env my_vla_env
+```
+
+### What It Does
+
+1. Checks conda installation
+2. Creates/activates conda environment (optional)
+3. Installs PyTorch with CUDA
+4. Installs transformers, accelerate, peft, wandb, etc.
+5. Installs VLA package in editable mode
+6. Verifies all imports work correctly
+
+---
+
+## verify_dataset.py
+
+Verify HDF5 dataset structure before training.
+
+### Usage
+
+```bash
+# Basic verification
+python scripts/verify_dataset.py \
+    --hdf5_path /path/to/demos.hdf5
+
+# With visualization
+python scripts/verify_dataset.py \
+    --hdf5_path /path/to/demos.hdf5 \
+    --visualize \
+    --num_samples 5
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--hdf5_path` | str | **required** | Path to HDF5 demo file |
+| `--visualize` | flag | False | Show sample images |
+| `--num_samples` | int | 3 | Number of samples to verify |
+
+---
+
+## train_mcx_card.sh
+
+Quick-start script for training on the MCX card dataset.
+
+### Usage
+
+```bash
+# Default settings
+./scripts/train_mcx_card.sh
+
+# Custom batch size
+./scripts/train_mcx_card.sh --batch_size 32
+
+# More epochs
+./scripts/train_mcx_card.sh --epochs 100
+
+# Resume training
+./scripts/train_mcx_card.sh --resume checkpoints/mcx_card/epoch_25.pt
+
+# Disable wandb
+./scripts/train_mcx_card.sh --no-wandb
+```
+
+### Default Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Dataset | `/home/tshiamo/IsaacLab/demos/mcx_card_demos_vla_224.hdf5` |
+| Instruction | "pick up the blue block and place it in the first card's closest slot" |
+| Action dim | 7 |
+| Batch size | 16 |
+| Epochs | 50 |
 
 ---
 
@@ -37,8 +150,11 @@ python scripts/train.py --config configs/training/pretrain_config.yaml
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--data_dir` | str | **required** | Path to training data directory |
+| `--data_dir` | str | None | Path to training data directory (folder-based) |
+| `--hdf5_path` | str | None | Path to HDF5 file with all demos |
 | `--val_data_dir` | str | None | Path to validation data directory |
+| `--val_hdf5_path` | str | None | Path to validation HDF5 file |
+| `--instruction` | str | "Pick up the object..." | Task instruction for VLA |
 | `--vlm_model` | str | `Qwen/Qwen2.5-VL-7B-Instruct` | Vision-language model name |
 | `--action_dim` | int | 7 | Robot action dimension |
 | `--chunk_size` | int | 16 | Action chunk size |
@@ -60,7 +176,15 @@ python scripts/train.py --config configs/training/pretrain_config.yaml
 ### Examples
 
 ```bash
-# Full training run with validation
+# Train from HDF5 file (recommended)
+python scripts/train.py \
+    --hdf5_path /path/to/demos.hdf5 \
+    --instruction "pick up the blue block and place it in the target" \
+    --action_dim 7 \
+    --epochs 50 \
+    --wandb_project vla-training
+
+# Full training run with validation (folder-based)
 python scripts/train.py \
     --data_dir data/demos/train \
     --val_data_dir data/demos/val \
@@ -340,6 +464,60 @@ visualizations/
 ├── flow_trajectory.png       # Flow mode
 └── attention.png             # Attention mode
 ```
+
+---
+
+## overfit_test.py
+
+Train the VLA on a small number of demos to verify the pipeline works end-to-end.
+If the model can overfit 5 demos, the architecture is correct. See [Diagnosis Report](../docs/diagnosis_overfit_test.md) for full analysis.
+
+### Usage
+
+```bash
+python scripts/overfit_test.py \
+    --hdf5_path data/cosmos_dataset_1k.hdf5 \
+    --key_mapping_file configs/key_mappings/nvidia_cosmos.json \
+    --num_demos 5 --max_steps 50000 --target_loss 0.10 --lr 3e-4
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--hdf5_path` | str | **required** | Path to HDF5 demo file |
+| `--key_mapping_file` | str | `configs/key_mappings/nvidia_cosmos.json` | Key mapping for dataset format |
+| `--num_demos` | int | 5 | Number of demos to overfit on |
+| `--max_steps` | int | 50000 | Maximum training steps |
+| `--target_loss` | float | 0.10 | Stop when loss reaches this |
+| `--lr` | float | 3e-4 | Learning rate |
+| `--batch_size` | int | 4 | Batch size |
+
+### Phases
+
+1. **Load dataset** (N demos, no augmentation)
+2. **Create fresh model** (no checkpoint)
+3. **Train until convergence** (or max steps)
+4. **Open-loop evaluation** on training demos
+5. **Verdict**: PASS (loss < 0.1, rel error < 0.3), PARTIAL (loss < 0.3), or FAIL
+
+---
+
+## diagnose_conditioning.py
+
+Three diagnostic tests to isolate conditioning pipeline issues.
+
+### Usage
+
+```bash
+python scripts/diagnose_conditioning.py
+```
+
+### Tests
+
+1. **VLM Embedding Variance**: Are embeddings identical across samples? (cosine similarity)
+2. **Condition Vector Variance**: Does proprio info reach the flow head?
+3. **Flow Head Isolation**: Can the flow head overfit with unique conditions? (no VLM needed)
 
 ---
 

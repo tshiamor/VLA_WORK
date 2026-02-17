@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, List, Tuple, Union
 from dataclasses import dataclass
+from PIL import Image
+import numpy as np
 
 
 @dataclass
@@ -27,6 +29,8 @@ class VisionEncoderConfig:
     # Vision processing settings
     min_pixels: int = 256 * 28 * 28
     max_pixels: int = 1280 * 28 * 28
+    # For batched training
+    use_4bit: bool = False  # Enable 4-bit quantization for memory efficiency
 
 
 class LoRALinear(nn.Module):
@@ -67,6 +71,7 @@ class QwenVisionEncoder(nn.Module):
     - LoRA adapters for parameter-efficient fine-tuning
     - Multi-image input (context + wrist cameras)
     - Language instruction conditioning
+    - Batched training with proper image processing
     """
 
     def __init__(self, config: Optional[VisionEncoderConfig] = None):
@@ -97,12 +102,28 @@ class QwenVisionEncoder(nn.Module):
         }
         torch_dtype = dtype_map.get(self.config.torch_dtype, torch.bfloat16)
 
-        # Load model and processor
+        # Load model with optional quantization
+        model_kwargs = {
+            "torch_dtype": torch_dtype,
+            "device_map": self.config.device_map,
+            "trust_remote_code": self.config.trust_remote_code,
+        }
+
+        if self.config.use_4bit:
+            try:
+                from transformers import BitsAndBytesConfig
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch_dtype,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            except ImportError:
+                print("Warning: bitsandbytes not available, skipping 4-bit quantization")
+
         self._model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             self.config.model_name,
-            torch_dtype=torch_dtype,
-            device_map=self.config.device_map,
-            trust_remote_code=self.config.trust_remote_code,
+            **model_kwargs,
         )
 
         self._processor = AutoProcessor.from_pretrained(
@@ -128,7 +149,9 @@ class QwenVisionEncoder(nn.Module):
             param.requires_grad = False
 
     def _add_lora_adapters(self):
-        """Add LoRA adapters to target modules."""
+        """Add LoRA adapters to target modules and hook them into the forward pass."""
+        self._lora_hooks = []
+
         for name, module in self._model.named_modules():
             if any(target in name for target in self.config.lora_target_modules):
                 if isinstance(module, nn.Linear):
@@ -147,6 +170,15 @@ class QwenVisionEncoder(nn.Module):
                             dtype=module.weight.dtype
                         )
                     self._lora_layers[name] = lora_layer
+
+                    # Register forward hook to apply LoRA during forward pass
+                    def _make_lora_hook(lora):
+                        def hook(module, input, output):
+                            return output + lora(input[0])
+                        return hook
+
+                    handle = module.register_forward_hook(_make_lora_hook(lora_layer))
+                    self._lora_hooks.append(handle)
 
         # Register LoRA layers as submodules
         self.lora_modules = nn.ModuleDict({
@@ -175,6 +207,56 @@ class QwenVisionEncoder(nn.Module):
             self.initialize()
         return self._model.config.hidden_size
 
+    def _tensor_to_pil(self, tensor: torch.Tensor) -> Image.Image:
+        """Convert a tensor image to PIL Image."""
+        # Handle different tensor formats
+        if tensor.dim() == 3:
+            # [C, H, W] or [H, W, C]
+            if tensor.shape[0] in [1, 3, 4]:  # Channel first
+                tensor = tensor.permute(1, 2, 0)
+            # Now [H, W, C]
+            tensor = tensor.cpu()
+            if tensor.dtype == torch.float32 or tensor.dtype == torch.float16:
+                tensor = (tensor * 255).clamp(0, 255).to(torch.uint8)
+            return Image.fromarray(tensor.numpy())
+        else:
+            raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
+
+    def prepare_inputs_batch(
+        self,
+        context_images: torch.Tensor,  # [B, C, H, W]
+        wrist_images: torch.Tensor,    # [B, C, H, W]
+        instructions: List[str],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Prepare batched inputs for the model.
+
+        This processes each sample individually through the Qwen processor
+        then stacks them for batched forward pass.
+        """
+        if not self._initialized:
+            self.initialize()
+
+        batch_size = context_images.shape[0]
+        all_inputs = []
+
+        for i in range(batch_size):
+            # Convert tensors to PIL images
+            context_pil = self._tensor_to_pil(context_images[i])
+            wrist_pil = self._tensor_to_pil(wrist_images[i])
+            instruction = instructions[i] if isinstance(instructions, list) else instructions
+
+            # Prepare single sample
+            inputs = self.prepare_inputs(
+                images=[context_pil, wrist_pil],
+                instruction=instruction,
+            )
+            all_inputs.append(inputs)
+
+        # Stack inputs (this is tricky because different samples may have different sequence lengths)
+        # For now, we'll process samples one at a time in forward
+        return {'batch_inputs': all_inputs}
+
     def prepare_inputs(
         self,
         images: List[Any],
@@ -195,13 +277,25 @@ class QwenVisionEncoder(nn.Module):
         if not self._initialized:
             self.initialize()
 
+        # Convert numpy arrays to PIL if needed
+        processed_images = []
+        for img in images:
+            if isinstance(img, np.ndarray):
+                if img.dtype == np.float32 or img.dtype == np.float64:
+                    img = (img * 255).clip(0, 255).astype(np.uint8)
+                processed_images.append(Image.fromarray(img))
+            elif isinstance(img, torch.Tensor):
+                processed_images.append(self._tensor_to_pil(img))
+            else:
+                processed_images.append(img)
+
         # Build conversation format for Qwen2.5-VL
         if image_labels is None:
-            image_labels = [f"Image {i+1}" for i in range(len(images))]
+            image_labels = ["Context view", "Wrist view"]
 
         # Create content with images and text
         content = []
-        for i, (img, label) in enumerate(zip(images, image_labels)):
+        for i, (img, label) in enumerate(zip(processed_images, image_labels)):
             content.append({"type": "image", "image": img})
             content.append({"type": "text", "text": f"[{label}]"})
 
@@ -222,7 +316,7 @@ class QwenVisionEncoder(nn.Module):
         # Process inputs
         inputs = self._processor(
             text=[text],
-            images=images,
+            images=processed_images,
             padding=True,
             return_tensors="pt",
         )
@@ -234,33 +328,44 @@ class QwenVisionEncoder(nn.Module):
         images: Optional[List[Any]] = None,
         instruction: Optional[str] = None,
         inputs: Optional[Dict[str, torch.Tensor]] = None,
+        # Batched inputs
+        context_images: Optional[torch.Tensor] = None,
+        wrist_images: Optional[torch.Tensor] = None,
+        instructions: Optional[List[str]] = None,
         return_last_hidden_state: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the vision-language model.
 
-        Args:
-            images: List of images (if inputs not provided)
-            instruction: Language instruction (if inputs not provided)
-            inputs: Pre-processed inputs (alternative to images+instruction)
-            return_last_hidden_state: Whether to return the last hidden state
+        Supports both single-sample and batched inputs.
 
-        Returns:
-            Dictionary containing:
-            - 'last_hidden_state': Hidden states from the last layer [B, seq_len, hidden_dim]
-            - 'pooled_output': Pooled representation [B, hidden_dim]
+        For batched training:
+            - context_images: [B, C, H, W]
+            - wrist_images: [B, C, H, W]
+            - instructions: List of B strings
+
+        For single sample:
+            - images: [context_pil, wrist_pil]
+            - instruction: str
         """
         if not self._initialized:
             self.initialize()
 
-        # Prepare inputs if not provided
+        device = next(self._model.parameters()).device
+
+        # Handle batched inputs for training
+        if context_images is not None and wrist_images is not None:
+            return self._forward_batch(
+                context_images, wrist_images, instructions, device, return_last_hidden_state
+            )
+
+        # Handle single sample or pre-processed inputs
         if inputs is None:
             if images is None or instruction is None:
                 raise ValueError("Either 'inputs' or both 'images' and 'instruction' must be provided")
             inputs = self.prepare_inputs(images, instruction)
 
         # Move inputs to model device
-        device = next(self._model.parameters()).device
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
         # Forward pass with output_hidden_states
@@ -271,23 +376,90 @@ class QwenVisionEncoder(nn.Module):
                 return_dict=True,
             )
 
+        return self._extract_outputs(outputs, inputs, return_last_hidden_state)
+
+    def _forward_batch(
+        self,
+        context_images: torch.Tensor,
+        wrist_images: torch.Tensor,
+        instructions: List[str],
+        device: torch.device,
+        return_last_hidden_state: bool,
+    ) -> Dict[str, torch.Tensor]:
+        """Process a batch of images by iterating through samples."""
+        batch_size = context_images.shape[0]
+        all_hidden_states = []
+        all_pooled = []
+
+        for i in range(batch_size):
+            # Convert single sample tensors to PIL
+            context_pil = self._tensor_to_pil(context_images[i])
+            wrist_pil = self._tensor_to_pil(wrist_images[i])
+
+            # Get instruction for this sample
+            instruction = instructions[i] if isinstance(instructions, list) else instructions
+
+            # Prepare inputs for single sample
+            inputs = self.prepare_inputs(
+                images=[context_pil, wrist_pil],
+                instruction=instruction,
+            )
+
+            # Move to device
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+
+            # Forward pass
+            with torch.set_grad_enabled(self.training and (self.config.use_lora or not self.config.freeze_backbone)):
+                outputs = self._model(
+                    **inputs,
+                    output_hidden_states=return_last_hidden_state,
+                    return_dict=True,
+                )
+
+            # Extract hidden states
+            if return_last_hidden_state and hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                hidden_state = outputs.hidden_states[-1]  # [1, seq_len, hidden_dim]
+
+                # Pool to fixed size representation
+                if 'attention_mask' in inputs:
+                    mask = inputs['attention_mask'].unsqueeze(-1)
+                    pooled = (hidden_state * mask).sum(dim=1) / mask.sum(dim=1)
+                else:
+                    pooled = hidden_state.mean(dim=1)
+
+                all_hidden_states.append(hidden_state[:, -1:, :])  # Last token
+                all_pooled.append(pooled)
+
+        # Stack batched outputs
+        result = {}
+        if all_pooled:
+            result['pooled_output'] = torch.cat(all_pooled, dim=0)  # [B, hidden_dim]
+            result['last_hidden_state'] = torch.cat(all_hidden_states, dim=0)  # [B, 1, hidden_dim]
+
+        return result
+
+    def _extract_outputs(
+        self,
+        outputs,
+        inputs: Dict[str, torch.Tensor],
+        return_last_hidden_state: bool,
+    ) -> Dict[str, torch.Tensor]:
+        """Extract relevant outputs from model forward pass.
+
+        Matches the batched training path: returns last token as
+        ``last_hidden_state`` [1, 1, hidden] and mean-pooled as
+        ``pooled_output`` [1, hidden].
+        """
         result = {}
 
         if return_last_hidden_state:
-            # Get last hidden state
             hidden_states = outputs.hidden_states[-1] if hasattr(outputs, 'hidden_states') else None
 
             if hidden_states is not None:
-                result['last_hidden_state'] = hidden_states
-
-                # Apply LoRA if enabled
-                if self.config.use_lora and self._lora_layers:
-                    # LoRA is applied during the forward pass of attention layers
-                    # The hidden states already include LoRA contributions
-                    pass
+                # Use last token only — consistent with _forward_batch
+                result['last_hidden_state'] = hidden_states[:, -1:, :]
 
                 # Create pooled output (mean of sequence)
-                # Exclude padding tokens if attention mask is available
                 if 'attention_mask' in inputs:
                     mask = inputs['attention_mask'].unsqueeze(-1)
                     pooled = (hidden_states * mask).sum(dim=1) / mask.sum(dim=1)

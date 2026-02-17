@@ -1,0 +1,35 @@
+# VLA Training Configuration — NVIDIA Cosmos Cube Stacking
+# ========================================================
+# Dataset: nvidia/PhysicalAI-Robotics-Manipulation-Augmented cosmos_dataset_1k.hdf5
+# Task: Stack 3 cubes (blue -> red -> green)
+# GPU: 24GB+ (optimized for single-GPU training)
+
+# Data
+hdf5_path: "data/cosmos_dataset_1k.hdf5"
+instruction: "Stack the cubes in order: place the red cube on the blue cube, then place the green cube on the red cube."
+key_mapping_file: "configs/key_mappings/nvidia_cosmos.json"
+
+# Model
+vlm_model: "Qwen/Qwen2.5-VL-7B-Instruct"
+action_dim: 7
+chunk_size: 16
+hidden_dim: 512
+proprio_dim: 27  # joint_pos(9) + joint_vel(9) + eef_pos(3) + eef_quat(4) + gripper_pos(2)
+
+# Training (RTX 5090 32GB optimized)
+epochs: 15
+batch_size: 8
+lr: 1.0e-4
+warmup_steps: 500
+gradient_accumulation: 4  # effective batch = 8 * 4 = 32
+
+# LoRA
+use_lora: true
+lora_r: 16
+
+# Checkpointing
+checkpoint_dir: "checkpoints/cube_stacking_cosmos"
+
+# Logging
+wandb_project: "vla-cube-stacking"
+wandb_run: "cosmos-1k-run1"

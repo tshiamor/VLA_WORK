@@ -1,0 +1,10 @@
+{
+    "context_rgb": "table_cam",
+    "wrist_rgb": "wrist_cam",
+    "joint_pos": "joint_pos",
+    "joint_vel": "joint_vel",
+    "eef_pos": "eef_pos",
+    "eef_quat": "eef_quat",
+    "gripper_pos": "gripper_pos",
+    "actions": "actions"
+}
